@@ -297,58 +297,58 @@ class LIFTSparseAdamW(Optimizer):
                 self.state[p]["step"] = 0
 
     def _compute_mask(self, param: Tensor) -> Tensor:
-        """Compute a binary mask of principal weights for a parameter.
-
-        A truncated singular value decomposition is performed on
-        ``param``.  The top ``filter_rank`` singular values and
-        corresponding singular vectors are used to reconstruct an
-        approximate weight matrix.  The entries with the largest
-        magnitude (as determined by either ``sparsity_ratio`` or
-        ``num_principal``) are selected to form the mask.
-
-        :param param: Weight matrix whose mask should be computed.
-        :returns: A boolean tensor with the same shape as ``param``
-            indicating selected entries.
-        :except RuntimeError: If SVD fails to converge.
         """
-        # Move the tensor to the desired device for SVD computation
+        Compute a binary mask of principal weights for any parameter tensor.
+
+        This will:
+         1. Flatten `param` to a 2D matrix of shape (m, n).
+         2. Perform a rank-r SVD on that matrix.
+         3. Reconstruct the top-r approximation and pick the top-k entries.
+         4. Un-flatten the mask back to param.shape.
+
+        :param param:  Any weight tensor (linear, conv, etc.).
+        :returns:      A boolean mask of the same shape as `param`.
+        """
+        # detach and cast
         p = param.detach()
         device = self.device or p.device
-        # convert to float32 for stable SVD (common practice)
         data = p.to(device=device, dtype=torch.float32)
-        # Perform truncated SVD
-        # We use torch.linalg.svd rather than svd_lowrank to guarantee
-        # precision.  For very large matrices one could consider
-        # torch.linalg.svdvals or randomized algorithms.
-        U, S, Vh = torch.linalg.svd(data, full_matrices=False)
+
+        # flatten to 2D
+        orig_shape = data.shape
+        if data.ndim > 2:
+            m = orig_shape[0]
+            n = int(torch.tensor(orig_shape[1:]).prod().item())
+            data2d = data.reshape(m, n)
+        else:
+            data2d = data
+            m, n = data2d.shape
+
+        # full SVD on the 2D tensor
+        U, S, Vh = torch.linalg.svd(data2d, full_matrices=False)
+
+        # pick the actual rank r
         r = min(self.filter_rank, S.shape[0])
-        U_r: Tensor = U[:, :r]
-        S_r: Tensor = S[:r]
-        V_r: Tensor = Vh[:r, :]
-        # reconstruct rank‑r approximation
-        # Equivalent to U_r @ diag(S_r) @ V_r
-        # We'll multiply S_r across columns of V_r for efficiency
-        reconstructed: Tensor = (U_r * S_r.unsqueeze(0)) @ V_r
-        # Determine how many entries to select
-        total_elems = reconstructed.numel()
+        U_r = U[:, :r]               # (m, r)
+        S_r = S[:r]                  # (r,)
+        V_r = Vh[:r, :]              # (r, n)
+
+        # reconstruct and select top-k entries
+        approx = (U_r * S_r.unsqueeze(0)) @ V_r  # (m, n)
+        total = approx.numel()
         if self.sparsity_ratio is not None:
-            k = max(1, int(total_elems * self.sparsity_ratio))
+            k = max(1, int(total * self.sparsity_ratio))
         else:
-            # number of principal weights: (m + n) * num_principal
-            m, n = reconstructed.shape
-            k = min(total_elems, (m + n) * self.num_principal)  # type: ignore[operator]
-            k = max(1, int(k))
-        # Flatten and select top‐k indices based on magnitude
-        flat: Tensor
-        if self.use_abs:
-            flat = reconstructed.abs().reshape(-1)
-        else:
-            flat = reconstructed.reshape(-1)
-        # Avoid extremely small k relative to matrix size
-        topk_vals = torch.topk(flat, k=k, largest=True)
-        mask_flat = torch.zeros_like(flat, dtype=torch.bool)
-        mask_flat[topk_vals.indices] = True
-        return mask_flat.view_as(param)
+            k = max(1, int(min(total, (m + n) * self.num_principal)))
+
+        flat = approx.abs().flatten() if self.use_abs else approx.flatten()
+        topk = torch.topk(flat, k, largest=True).indices
+        mask2d = torch.zeros_like(flat, dtype=torch.bool)
+        mask2d[topk] = True
+
+        # un-flatten to original shape
+        mask = mask2d.view(orig_shape)
+        return mask
 
     def step(self, closure: Optional[Callable[[], float]] = None) -> Optional[float]:
         """Perform a single optimization step.
