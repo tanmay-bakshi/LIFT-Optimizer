@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import time
 from typing import Tuple
 
 import torch
@@ -36,13 +37,13 @@ CHECKPOINT_DIR: str = "./checkpoints"
 NUM_EPOCHS: int = 5
 BATCH_SIZE: int = 128
 NUM_WORKERS: int = 4  # 0 for Windows if you hit issues
-BASE_LR: float = 0.01
+BASE_LR: float = 0.001
 MOMENTUM: float = 0.9
 WEIGHT_DECAY: float = 5e-4
 LR_DECAY_EPOCHS: Tuple[int, ...] = (3,)  # Decay LR by 0.1 at these epochs
 
 # Runtime
-DEVICE: torch.device = torch.device("mps")
+DEVICE: torch.device = torch.device("cuda")
 SEED: int = 42
 
 # --------------------------- Reproducibility utils -------------------------- #
@@ -98,7 +99,7 @@ def build_model() -> nn.Module:
 
     :returns: Model ready for training.
     """
-    model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2)
+    model = models.resnet101(weights=models.ResNet101_Weights.IMAGENET1K_V2)
     num_features: int = model.fc.in_features
     model.fc = nn.Linear(num_features, 10)
     return model.to(DEVICE)
@@ -113,10 +114,14 @@ def build_optimizer(model: nn.Module) -> optim.Optimizer:
     # return optim.SGD(model.parameters(), lr=BASE_LR, momentum=MOMENTUM, weight_decay=WEIGHT_DECAY)
     return LIFTSparseAdamW(
         model.named_parameters(),
-        num_principal=4,
         filter_rank=8,
+        num_principal=64,
         update_interval=200,
     )
+    # return optim.AdamW(
+    #     model.named_parameters(),
+    #     lr=1e-4,
+    # )
 
 
 def adjust_learning_rate(optimizer: optim.Optimizer, epoch: int) -> None:
@@ -133,6 +138,21 @@ def adjust_learning_rate(optimizer: optim.Optimizer, epoch: int) -> None:
 
 
 # ----------------------------- Train & Validate ----------------------------- #
+
+
+#@torch.compile(fullgraph=False)
+def step_fn(images, targets, criterion, model, optimizer):
+    # Forward
+    outputs = model(images)
+    loss = criterion(outputs, targets)
+
+    # Backward
+    optimizer.zero_grad() #(set_to_none=True)
+    loss.backward()
+    optimizer.step()
+
+    return outputs, loss
+
 
 def train_one_epoch(model: nn.Module, loader: DataLoader, criterion: nn.Module, optimizer: optim.Optimizer, epoch: int) -> None:
     """Train the model for one epoch.
@@ -151,14 +171,7 @@ def train_one_epoch(model: nn.Module, loader: DataLoader, criterion: nn.Module, 
     for step, (images, targets) in enumerate(loader, start=1):
         images, targets = images.to(DEVICE, non_blocking=True), targets.to(DEVICE, non_blocking=True)
 
-        # Forward
-        outputs = model(images)
-        loss = criterion(outputs, targets)
-
-        # Backward
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        optimizer.step()
+        outputs, loss = step_fn(images, targets, criterion, model, optimizer)
 
         # Statistics
         running_loss += loss.item() * images.size(0)
@@ -217,7 +230,15 @@ def main() -> None:
 
     for epoch in range(1, NUM_EPOCHS + 1):
         adjust_learning_rate(optimizer, epoch)
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        start = time.time()
         train_one_epoch(model, train_loader, criterion, optimizer, epoch)
+        torch.cuda.synchronize()
+        end = time.time()
+        peak_bytes = torch.cuda.max_memory_allocated()
+        print(f"Peak memory: {peak_bytes/1024**2:.1f} MiB")
+        print(f"Time: {end - start:.2f}s")
         val_loss, val_acc = evaluate(model, val_loader, criterion)
 
         print(f"Validation — Epoch {epoch}/{NUM_EPOCHS}: Loss={val_loss:.4f} | Acc={val_acc:.2f}%")

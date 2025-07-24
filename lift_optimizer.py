@@ -259,6 +259,7 @@ class LIFTSparseAdamW(Optimizer):
                 sparse_params.append(p)
             else:
                 dense_params.append(p)
+                p.requires_grad = False
 
         # Build param_groups for the underlying Optimizer
         param_groups = []
@@ -288,7 +289,7 @@ class LIFTSparseAdamW(Optimizer):
                 mask = self._compute_mask(p)
                 # flatten mask indices for convenience
                 self.state[p]["mask"] = mask
-                num_selected = mask.sum().item()
+                num_selected = mask.sum().to(torch.long)
                 # first and second moment vectors for selected entries
                 self.state[p]["m_update"] = torch.zeros(num_selected, dtype=p.dtype, device=p.device)
                 self.state[p]["v_update"] = torch.zeros(num_selected, dtype=p.dtype, device=p.device)
@@ -318,7 +319,7 @@ class LIFTSparseAdamW(Optimizer):
         orig_shape = data.shape
         if data.ndim > 2:
             m = orig_shape[0]
-            n = int(torch.tensor(orig_shape[1:]).prod().item())
+            n = torch.tensor(orig_shape[1:]).prod().to(torch.long)
             data2d = data.reshape(m, n)
         else:
             data2d = data
@@ -337,9 +338,10 @@ class LIFTSparseAdamW(Optimizer):
         approx = (U_r * S_r.unsqueeze(0)) @ V_r  # (m, n)
         total = approx.numel()
         if self.sparsity_ratio is not None:
-            k = max(1, int(total * self.sparsity_ratio))
+            k = (total * self.sparsity_ratio).to(torch.long)
         else:
-            k = max(1, int(min(total, (m + n) * self.num_principal)))
+            k = torch.min(torch.tensor([total, (m + n) * self.num_principal]))
+        k = torch.max(torch.tensor([torch.ones_like(k), k]))
 
         flat = approx.abs().flatten() if self.use_abs else approx.flatten()
         topk = torch.topk(flat, k, largest=True).indices
